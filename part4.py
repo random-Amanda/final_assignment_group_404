@@ -1,169 +1,76 @@
 import os
 import json
-import math
-import re
-from pydriller import RepositoryMining
-from javalang.parse import parse as javalang_parse
-import git
-from datetime import datetime, timedelta
-import javalang
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
 
+# Define output directory for visualizations
+visualizations_dir = "visualizations"
+os.makedirs(visualizations_dir, exist_ok=True)
 
-# Paths and configuration for output directories
-repo_list_file = "project_links.txt"
-clone_dir = "cloned_repos"
-output_dir = "rminer-outputs"
-os.makedirs(clone_dir, exist_ok=True)
-os.makedirs(output_dir, exist_ok=True)
+# Define the metrics to plot
+metrics_to_plot = [
+    'SEXP', 'CBO', 'WMC', 'RFC', 'ELOC', 'NOM', 'NOPM', 'DIT', 'NOC', 'NOF', 'NOSF',
+    'NOPF', 'NOSM', 'NOSI', 'HsLCOM', 'C3', 'ComRead', 'ND', 'NS', 'AGE', 'FIX', 'NUC',
+    'CEXP', 'REXP', 'OEXP', 'EXP'
+]
 
+def plot_metrics_evolution(metrics_file, repo_name):
+    # Load metrics data
+    with open(metrics_file, "r", encoding='utf-8') as file:
+        metrics_data = json.load(file)
 
-# Helper function to calculate metrics
-def calculate_metrics(repo_path, commit_sha):
-    metrics_data = []
+    # Convert metrics data to DataFrame for easier manipulation
+    df = pd.DataFrame(metrics_data)
 
-    # Fetch the specific commit using RepositoryMining
-    for commit in RepositoryMining(repo_path, single=commit_sha).traverse_commits():
-        if commit.hash == commit_sha:
-            for modified_file in commit.modifications:
-                if modified_file.filename.endswith('.java') and modified_file.source_code:
-                    # Parse the file's source code with javalang for class-level analysis
-                    tree = javalang_parse(modified_file.source_code)
+    # Ensure 'commit hash' is a string for better plotting
+    df['commit hash'] = df['commit hash'].astype(str)
 
-                    # Initialize metric variables
-                    ND, NS, NDEV, NUC, CEXP, REXP, OEXP, EXP = 0, 0, 0, 0, 0, 0, 0, 0
-                    SEXP, CBO, WMC, RFC, ELOC, NOM, NOPM, DIT, NOC = 0, 0, 0, 0, 0, 0, 0, 0, 0
-                    NOF, NOSF, NOPF, NOSM, NOSI, HsLCOM, C3, ComRead = 0, 0, 0, 0, 0, 0, 0, 0
+    # Sort data by the order of commits, if not already ordered (commits are usually ordered in time)
+    df.sort_values(by='commit hash', ascending=True, inplace=True)
 
-                    # Process class and method details
-                    for path, node in tree:
-                        if isinstance(node, javalang.tree.ClassDeclaration):
-                            # Metrics on class level
-                            classes_in_file = [node]  # List of class declarations
-                            NOM = len([m for m in node.methods])  # Number of methods
-                            NOPM = len([m for m in node.methods if m.modifiers == 'public'])
-                            NOF = len(node.fields)
-                            NOSF = len([f for f in node.fields if 'static' in f.modifiers])
-                            NOPF = len([f for f in node.fields if 'public' in f.modifiers])
+    # Remove rows with NaN values in relevant columns
+    df.dropna(subset=['commit hash'] + metrics_to_plot, inplace=True)
 
-                            # Compute depth of inheritance (DIT)
-                            DIT = 1  # Assumes a flat hierarchy, could expand with class hierarchies
+    # Create a folder for each repository under the visualizations directory
+    repo_visualizations_dir = os.path.join(visualizations_dir, repo_name)
+    os.makedirs(repo_visualizations_dir, exist_ok=True)
 
-                            # Compute number of direct children (NOC) and Weighted Methods per Class (WMC)
-                            # WMC = sum(m.cyclomatic_complexity for m in node.methods if m.body)
-                            NOC = 0  # This would require analyzing inheritance across files
+    # Plot for each metric
+    for metric in metrics_to_plot:
+        plt.figure(figsize=(10, 6))
 
-                            # ELOC (Effective Lines of Code)
-                            ELOC = len([line for line in modified_file.source_code.splitlines() if line.strip()])
+        # Plot the metric's evolution over the commit order (index-based)
+        sns.lineplot(data=df, x=df.index, y=metric, marker='o', label=metric)
 
-                            # RFC - Response for a Class: count methods + remote methods called recursively
-                            RFC = NOM + len([call for m in node.methods for call in m.body if hasattr(call, 'method')])
+        # Customize the plot
+        plt.title(f"Evolution of {metric} for {repo_name}")
+        plt.xlabel('Commit Order')
+        plt.ylabel(f'{metric} Value')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
 
-                    # Calculate additional file-level metrics using the commit history
-                    file_commits = [
-                        c for c in RepositoryMining(repo_path).traverse_commits()
-                        if any(m.filename == modified_file.filename for m in c.modifications)
-                    ]
-                    authors = set(c.author.name for c in file_commits)
-                    NDEV = len(authors)
+        # Save the plot as an image in the repository's folder
+        plot_filename = os.path.join(repo_visualizations_dir, f"{repo_name}_{metric}_evolution.png")
+        plt.savefig(plot_filename)
+        plt.close()
 
-                    directories = {os.path.dirname(mod.filename) for mod in commit.modifications}
-                    ND = len(directories)
-                    subsystems = {os.path.dirname(mod.filename).split(os.sep)[0] for mod in commit.modifications}
-                    NS = len(subsystems)
+    print(f"Visualizations for {repo_name} saved to {repo_visualizations_dir}")
 
-                    time_deltas = [(commit.committer_date - file_commit.committer_date).days
-                                   for file_commit in file_commits if file_commit.hash != commit.hash]
-                    AGE = sum(time_deltas) / len(time_deltas) if time_deltas else 0
-
-                    FIX = bool(re.search(r'\b[A-Za-z]+-\d+\b', commit.msg))
-
-                    NUC = len([c for c in RepositoryMining(repo_path).traverse_commits() if any(
-                        m.filename == modified_file.filename for m in c.modifications)])
-
-                    CEXP = sum(1 for c in file_commits if c.author.name == commit.author.name)
-
-                    one_month_ago = datetime.now(commit.committer_date.tzinfo) - timedelta(days=30)
-                    REXP = len([c for c in file_commits if
-                                c.author.name == commit.author.name and c.committer_date > one_month_ago])
-
-                    contributions = {
-                        author: sum(mod.added for c in file_commits for mod in c.modifications if
-                                    mod.filename == modified_file.filename and c.author.name == author)
-                        for author in authors
-                    }
-                    highest_contributor = max(contributions, key=contributions.get, default=None)
-                    project_total_additions = sum(
-                        mod.added for c in RepositoryMining(repo_path).traverse_commits() for mod in c.modifications)
-                    highest_contributor_additions = contributions[highest_contributor] if highest_contributor else 0
-                    OEXP = (
-                                       highest_contributor_additions / project_total_additions) * 100 if project_total_additions > 0 else 0
-
-                    author_experience = [sum(1 for mod in c.modifications if mod.filename == modified_file.filename)
-                                         for c in RepositoryMining(repo_path).traverse_commits() for author in authors]
-                    exp_product = math.prod(author_experience) if author_experience else 0
-                    EXP = exp_product ** (1 / len(author_experience)) if author_experience else 0
-
-                    # Append calculated metrics for each modified file in the commit
-                    metrics = {
-                        "commit hash": commit.hash,
-                        "file": modified_file.filename,
-                        "SEXP": SEXP,
-                        "CBO": CBO,
-                        "WMC": WMC,
-                        "RFC": RFC,
-                        "ELOC": ELOC,
-                        "NOM": NOM,
-                        "NOPM": NOPM,
-                        "DIT": DIT,
-                        "NOC": NOC,
-                        "NOF": NOF,
-                        "NOSF": NOSF,
-                        "NOPF": NOPF,
-                        "NOSM": NOSM,
-                        "NOSI": NOSI,
-                        "HsLCOM": HsLCOM,
-                        "C3": C3,
-                        "ComRead": ComRead,
-                        "ND": ND,
-                        "NS": NS,
-                        "AGE": AGE,
-                        "FIX": FIX,
-                        "NUC": NUC,
-                        "CEXP": CEXP,
-                        "REXP": REXP,
-                        "OEXP": OEXP,
-                        "EXP": EXP
-                    }
-                    metrics_data.append(metrics)
-            break  # Exit after processing the specified commit
-    return metrics_data
-
-
-# Process each repository
-with open(repo_list_file, "r") as file:
+# Iterate through repositories and generate visualizations
+with open("project_links4.txt", "r") as file:
     repo_urls = [line.strip() for line in file if line.strip()]
 
 for repo_url in repo_urls:
     repo_name = repo_url.split("/")[-1].replace(".git", "")
-    repo_path = os.path.join(clone_dir, repo_name)
-    output_file = os.path.join(output_dir, f"{repo_name}_refactorings.json")
-    metrics_file = os.path.join(output_dir, f"{repo_name}_metrics.json")
+    metrics_file = os.path.join("rminer-outputs", f"{repo_name}_metrics.json")
 
     try:
-        with open(output_file, "r", encoding="utf-8") as json_file:
-            refactoring_data = json.load(json_file)
-            metrics_results = []
-
-            for refactoring in refactoring_data.get("commits", []):
-                commit_sha = refactoring.get("sha1")
-                if commit_sha:
-                    metrics = calculate_metrics(repo_path, commit_sha)
-                    metrics_results.extend(metrics)
-
-            with open(metrics_file, "w", encoding='utf-8') as metrics_file_out:
-                json.dump(metrics_results, metrics_file_out, indent=4)
-
+        if os.path.exists(metrics_file):
+            plot_metrics_evolution(metrics_file, repo_name)
+        else:
+            print(f"Metrics file for {repo_name} not found.")
     except Exception as e:
         print(f"Error processing {repo_name}: {e}")
 
-print("Metrics data has been saved.")
+print("Visualization process completed.")
